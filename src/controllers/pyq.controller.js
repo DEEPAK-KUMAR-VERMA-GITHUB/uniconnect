@@ -1,22 +1,32 @@
 import { deleteFile } from "../utils/cloudinaryConfig.js";
 import { createNotification } from "./notification.controller.js";
-import { Subject } from "../models/subject.model.js";
+import { Subject, Student } from "../models/index.js";
+import { ErrorHandler } from "../utils/ErrorHandler.js";
 import { PYQ } from "../models/pyq.model.js";
+import { Subject } from "../models/subject.model.js";
 import { Student } from "../models/student.model.js";
 
 export const uploadSubjectPYQ = async (request, reply) => {
   try {
     const faculty = request.user;
-    const { title, subjectId, year, semester } = request.body;
+    const { title, subjectId, year, semester, examType } = request.body;
 
     if (!request.file) {
       throw new ErrorHandler("Please upload a PDF file", 400);
     }
 
+    // Validate exam type
+    const validExamTypes = ["MID_TERM", "END_TERM", "PRACTICAL"];
+    if (!validExamTypes.includes(examType)) {
+      await deleteFile(request.file.public_id);
+      throw new ErrorHandler("Invalid exam type", 400);
+    }
+
+    // Verify subject and faculty authorization
     const subject = await Subject.findOne({
       _id: subjectId,
       subjectFaculty: faculty._id,
-    });
+    }).populate("course");
 
     if (!subject) {
       await deleteFile(request.file.public_id);
@@ -26,37 +36,44 @@ export const uploadSubjectPYQ = async (request, reply) => {
       );
     }
 
+    // Create PYQ with organized structure
     const pyq = await PYQ.create({
       title,
-      subject: subject.subjectName,
+      subject: subject._id,
       year,
       semester,
+      examType,
       filepath: request.file.path,
       publicId: request.file.public_id,
       filename: request.file.originalname,
       uploadedBy: faculty._id,
+      course: subject.course._id,
     });
 
+    // Update subject with new PYQ reference
     await Subject.findByIdAndUpdate(subjectId, {
       $push: { subjectPYQs: pyq._id },
     });
 
-    // Notify students about new PYQ
+    // Notify relevant students
     const students = await Student.find({
-      course: subject.course,
-      semester: subject.semester,
+      course: subject.course._id,
+      semester: semester,
+      isActive: true,
     });
 
-    for (const student of students) {
-      await createNotification({
+    const notificationPromises = students.map((student) =>
+      createNotification({
         recipient: student._id,
         recipientModel: "Student",
-        title: "New Previous Year Question Paper",
-        message: `New PYQ uploaded for ${subject.subjectName}: ${title} (${year})`,
+        title: `New ${examType} Question Paper`,
+        message: `${subject.subjectName}: ${title} (${year}) has been uploaded`,
         type: "PYQ",
         relatedId: pyq._id,
-      });
-    }
+      })
+    );
+
+    await Promise.all(notificationPromises);
 
     return reply.code(201).send({
       success: true,
@@ -64,37 +81,33 @@ export const uploadSubjectPYQ = async (request, reply) => {
       pyq,
     });
   } catch (error) {
-    if (request.file && request.file.public_id) {
-      await deleteFile(request.file.public_id);
+    if (request.file?.public_id) {
+      await deleteFile(request.file.public_id).catch(console.error);
     }
     throw new ErrorHandler(error.message, error.statusCode || 500);
   }
 };
 
-export const deletePYQ = async (request, reply) => {
+export const getPYQs = async (request, reply) => {
   try {
-    const pyq = await PYQ.findById(request.params.id);
+    const { subjectId, year, semester, examType } = request.query;
+    const query = {};
 
-    if (!pyq) {
-      throw new ErrorHandler("PYQ not found", 404);
-    }
+    if (subjectId) query.subject = subjectId;
+    if (year) query.year = year;
+    if (semester) query.semester = semester;
+    if (examType) query.examType = examType;
 
-    if (pyq.uploadedBy.toString() !== request.user._id.toString()) {
-      throw new ErrorHandler("Not authorized to delete this PYQ", 403);
-    }
-
-    await deleteFile(pyq.publicId);
-    await Subject.findOneAndUpdate(
-      { subjectName: pyq.subject },
-      { $pull: { subjectPYQs: pyq._id } }
-    );
-    await pyq.remove();
+    const pyqs = await PYQ.find(query)
+      .populate("subject", "subjectName subjectCode")
+      .populate("uploadedBy", "name")
+      .sort({ year: -1, createdAt: -1 });
 
     return reply.code(200).send({
       success: true,
-      message: "PYQ deleted successfully",
+      pyqs,
     });
   } catch (error) {
-    throw new ErrorHandler(error.message, error.statusCode || 500);
+    throw new ErrorHandler(error.message, 500);
   }
 };
