@@ -37,4 +37,4 @@ const assignmentSchema = new mongoose.Schema({
     },
   ],
 });
-export default Assignment = mongoose.model("Assignment", assignmentSchema);
+export const Assignment = mongoose.model("Assignment", assignmentSchema);

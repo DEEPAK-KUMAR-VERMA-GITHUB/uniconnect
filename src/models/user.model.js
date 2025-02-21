@@ -62,12 +62,28 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-
+    verificationDocument: {
+      type: String,
+      required: [true, "Verification document is required"],
+    },
     resetPasswordToken: String,
     resetPasswordExpire: Date,
   },
   { timestamps: true }
 );
+
+// const resetToken = function () {
+//   const resetToken = crypto.randomBytes(20).toString("hex");
+
+//   this.resetPasswordToken = crypto
+//     .createHash("sha256")
+//     .update(resetToken)
+//     .digest("hex");
+
+//   this.resetPasswordExpire = Date.now() + 15 * 60 * 1000;
+
+//   return resetToken;
+// };
 
 userSchema.methods.getResetPasswordToken = function () {
   const resetToken = crypto.randomBytes(20).toString("hex");

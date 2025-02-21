@@ -1,17 +1,9 @@
-import mongoose from 'mongoose';
-import { Assignment } from "../models/assignment.model.js";
-import { Subject } from "../models/subject.model.js";
-import { ErrorHandler } from "../utils/ErrorHandler.js";
-import { createObjectId } from '../utils/createObjectId.js';
+import { Assignment } from '../models/assignment.model.js';
+import { Subject } from '../models/subject.model.js';
+import { Student } from '../models/user.model.js';
+import { deleteFile } from '../utils/cloudinaryConfig.js';
+import { createNotification } from './notification.controller.js';
 
-let gfs;
-mongoose.connection.once('open', () => {
-  gfs = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
-    bucketName: 'assignments'
-  });
-});
-
-// Faculty uploads assignment
 export const uploadAssignment = async (request, reply) => {
   try {
     const faculty = request.user;
@@ -21,14 +13,13 @@ export const uploadAssignment = async (request, reply) => {
       throw new ErrorHandler("Please upload a PDF file", 400);
     }
 
-    // Verify if subject exists and faculty teaches it
     const subject = await Subject.findOne({
       _id: subjectId,
       subjectFaculty: faculty._id,
     });
 
     if (!subject) {
-      await gfs.delete(createObjectId(request.file.id));
+      await deleteFile(request.file.public_id);
       throw new ErrorHandler("You are not authorized to upload assignments for this subject", 403);
     }
 
@@ -36,17 +27,34 @@ export const uploadAssignment = async (request, reply) => {
       title,
       description,
       dueDate,
-      filepath: request.file.id,
-      filename: request.file.filename,
+      filepath: request.file.path,
+      publicId: request.file.public_id,
+      filename: request.file.originalname,
       subject: subjectId,
       uploadedBy: faculty._id,
       submissions: []
     });
 
-    // Update subject with new assignment reference
     await Subject.findByIdAndUpdate(subjectId, {
       $push: { subjectAssignments: assignment._id },
     });
+
+    // Notify all students in the subject's course
+    const students = await Student.find({ 
+      course: subject.course,
+      semester: subject.semester 
+    });
+
+    for (const student of students) {
+      await createNotification({
+        recipient: student._id,
+        recipientModel: 'Student',
+        title: 'New Assignment',
+        message: `New assignment posted for ${subject.subjectName}: ${title}. Due date: ${new Date(dueDate).toLocaleDateString()}`,
+        type: 'ASSIGNMENT',
+        relatedId: assignment._id
+      });
+    }
 
     return reply.code(201).send({
       success: true,
@@ -54,33 +62,32 @@ export const uploadAssignment = async (request, reply) => {
       assignment
     });
   } catch (error) {
-    if (request.file && request.file.id) {
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
+    if (request.file && request.file.public_id) {
+      await deleteFile(request.file.public_id);
     }
     throw new ErrorHandler(error.message, error.statusCode || 500);
   }
 };
 
-// Student submits assignment
 export const submitAssignment = async (request, reply) => {
   try {
     const student = request.user;
     const { assignmentId } = request.params;
-    
+
     if (!request.file) {
-      throw new ErrorHandler("Please upload your submission", 400);
+      throw new ErrorHandler("Please upload a PDF file", 400);
     }
 
     const assignment = await Assignment.findById(assignmentId);
     if (!assignment) {
-      await gfs.delete(createObjectId(request.file.id));
+      await deleteFile(request.file.public_id);
       throw new ErrorHandler("Assignment not found", 404);
     }
 
-    // Check if submission deadline has passed
-    if (new Date(assignment.dueDate) < new Date()) {
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
-      throw new ErrorHandler("Submission deadline has passed", 400);
+    // Check if submission is past due date
+    if (new Date() > new Date(assignment.dueDate)) {
+      await deleteFile(request.file.public_id);
+      throw new ErrorHandler("Assignment submission deadline has passed", 400);
     }
 
     // Check if student has already submitted
@@ -89,50 +96,43 @@ export const submitAssignment = async (request, reply) => {
     );
 
     if (existingSubmission) {
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
-      throw new ErrorHandler("You have already submitted this assignment", 400);
+      // Delete old submission from Cloudinary
+      await deleteFile(existingSubmission.publicId);
+      
+      // Update existing submission
+      existingSubmission.filepath = request.file.path;
+      existingSubmission.publicId = request.file.public_id;
+      existingSubmission.submittedAt = Date.now();
+    } else {
+      // Add new submission
+      assignment.submissions.push({
+        filepath: request.file.path,
+        publicId: request.file.public_id,
+        student: student._id,
+        submittedAt: Date.now()
+      });
     }
-
-    assignment.submissions.push({
-      filepath: request.file.id,
-      filename: request.file.filename,
-      student: student._id,
-      submittedAt: new Date()
-    });
 
     await assignment.save();
 
-    return reply.code(201).send({
+    // Notify faculty
+    await createNotification({
+      recipient: assignment.uploadedBy,
+      recipientModel: 'Faculty',
+      title: 'New Assignment Submission',
+      message: `${student.name} has submitted the assignment: ${assignment.title}`,
+      type: 'ASSIGNMENT',
+      relatedId: assignment._id
+    });
+
+    return reply.code(200).send({
       success: true,
       message: "Assignment submitted successfully"
     });
   } catch (error) {
-    if (request.file && request.file.id) {
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
+    if (request.file && request.file.public_id) {
+      await deleteFile(request.file.public_id);
     }
-    throw new ErrorHandler(error.message, error.statusCode || 500);
-  }
-};
-
-// Get assignment file
-export const getAssignmentFile = async (request, reply) => {
-  try {
-    const assignment = await Assignment.findById(request.params.id);
-    if (!assignment) {
-      throw new ErrorHandler("Assignment not found", 404);
-    }
-
-    const file = await gfs.find({ _id: createObjectId(assignment.filepath) }).toArray();
-    if (!file || file.length === 0) {
-      throw new ErrorHandler("File not found", 404);
-    }
-
-    reply.header('Content-Type', 'application/pdf');
-    reply.header('Content-Disposition', `inline; filename="${assignment.filename}"`);
-    
-    const downloadStream = gfs.openDownloadStream(new mongoose.Types.ObjectId(assignment.filepath));
-    return reply.send(downloadStream);
-  } catch (error) {
     throw new ErrorHandler(error.message, error.statusCode || 500);
   }
 };

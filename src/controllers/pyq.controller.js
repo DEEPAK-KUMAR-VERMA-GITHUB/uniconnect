@@ -1,15 +1,8 @@
-import mongoose from "mongoose";
-import { PYQ } from "../models/pyq.model.js";
+import { deleteFile } from "../utils/cloudinaryConfig.js";
+import { createNotification } from "./notification.controller.js";
 import { Subject } from "../models/subject.model.js";
-import { ErrorHandler } from "../utils/ErrorHandler.js";
-import { createObjectId } from "../utils/createObjectId.js";
-
-let gfs;
-mongoose.connection.once("open", () => {
-  gfs = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
-    bucketName: "pyqs",
-  });
-});
+import { PYQ } from "../models/pyq.model.js";
+import { Student } from "../models/student.model.js";
 
 export const uploadSubjectPYQ = async (request, reply) => {
   try {
@@ -20,14 +13,13 @@ export const uploadSubjectPYQ = async (request, reply) => {
       throw new ErrorHandler("Please upload a PDF file", 400);
     }
 
-    // Verify if subject exists and faculty teaches it
     const subject = await Subject.findOne({
       _id: subjectId,
       subjectFaculty: faculty._id,
     });
 
     if (!subject) {
-      await gfs.delete(createObjectId(request.file.id));
+      await deleteFile(request.file.public_id);
       throw new ErrorHandler(
         "You are not authorized to upload PYQs for this subject",
         403
@@ -39,15 +31,32 @@ export const uploadSubjectPYQ = async (request, reply) => {
       subject: subject.subjectName,
       year,
       semester,
-      filepath: request.file.id,
-      filename: request.file.filename,
+      filepath: request.file.path,
+      publicId: request.file.public_id,
+      filename: request.file.originalname,
       uploadedBy: faculty._id,
     });
 
-    // Update subject with new PYQ reference
     await Subject.findByIdAndUpdate(subjectId, {
       $push: { subjectPYQs: pyq._id },
     });
+
+    // Notify students about new PYQ
+    const students = await Student.find({
+      course: subject.course,
+      semester: subject.semester,
+    });
+
+    for (const student of students) {
+      await createNotification({
+        recipient: student._id,
+        recipientModel: "Student",
+        title: "New Previous Year Question Paper",
+        message: `New PYQ uploaded for ${subject.subjectName}: ${title} (${year})`,
+        type: "PYQ",
+        relatedId: pyq._id,
+      });
+    }
 
     return reply.code(201).send({
       success: true,
@@ -55,63 +64,31 @@ export const uploadSubjectPYQ = async (request, reply) => {
       pyq,
     });
   } catch (error) {
-    // Clean up uploaded file if there's an error
-    if (request.file && request.file.id) {
-      await gfs.delete(createObjectId(request.file.id));
+    if (request.file && request.file.public_id) {
+      await deleteFile(request.file.public_id);
     }
     throw new ErrorHandler(error.message, error.statusCode || 500);
   }
 };
 
-// Function to download/view PYQ
-export const getPYQFile = async (request, reply) => {
+export const deletePYQ = async (request, reply) => {
   try {
     const pyq = await PYQ.findById(request.params.id);
+
     if (!pyq) {
       throw new ErrorHandler("PYQ not found", 404);
     }
 
-    const file = await gfs
-      .find({ _id: createObjectId(pyq.filepath) })
-      .toArray();
-    if (!file || file.length === 0) {
-      throw new ErrorHandler("File not found", 404);
+    if (pyq.uploadedBy.toString() !== request.user._id.toString()) {
+      throw new ErrorHandler("Not authorized to delete this PYQ", 403);
     }
 
-    reply.header("Content-Type", "application/pdf");
-    reply.header("Content-Disposition", `inline; filename="${pyq.filename}"`);
-
-    const downloadStream = gfs.openDownloadStream(createObjectId(pyq.filepath));
-    return reply.send(downloadStream);
-  } catch (error) {
-    throw new ErrorHandler(error.message, error.statusCode || 500);
-  }
-};
-
-// function to remove pyq
-export const removePYQ = async (request, reply) => {
-  try {
-    const faculty = request.user;
-    const pyqId = request.params.id;
-
-    const pyq = await PYQ.findOne({ _id: pyqId, uploadedBy: faculty._id });
-    if (!pyq) {
-      throw new ErrorHandler(
-        "PYQ not found or you are not authorized to delete this PYQ",
-        404
-      );
-    }
-
-    // Delete the PYQ file from GridFS
-    await gfs.delete(createObjectId(pyq.filepath));
-
-    // Remove the PYQ reference from the subject
-    await Subject.findByIdAndUpdate(pyq.subject, {
-      $pull: { subjectPYQs: pyq._id },
-    });
-
-    // Delete the PYQ document from the database
-    await PYQ.findByIdAndDelete(pyqId);
+    await deleteFile(pyq.publicId);
+    await Subject.findOneAndUpdate(
+      { subjectName: pyq.subject },
+      { $pull: { subjectPYQs: pyq._id } }
+    );
+    await pyq.remove();
 
     return reply.code(200).send({
       success: true,

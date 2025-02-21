@@ -1,24 +1,14 @@
-import { Note } from "../models/note.model.js";
-import { ErrorHandler } from "../utils/ErrorHandler.js";
+import { Student } from "../models/user.model.js";
 import { Subject } from "../models/subject.model.js";
-
-import mongoose from 'mongoose';
+import { deleteFile } from "../utils/cloudinaryConfig.js";
+import { createNotification } from "./notification.controller.js";
 import { Note } from "../models/note.model.js";
-import { Subject } from "../models/subject.model.js";
-import { ErrorHandler } from "../utils/ErrorHandler.js";
-
-let gfs;
-mongoose.connection.once('open', () => {
-  gfs = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
-    bucketName: 'notes'
-  });
-});
 
 export const uploadSubjectNotes = async (request, reply) => {
   try {
     const faculty = request.user;
     const { title, description, subjectId, type } = request.body;
-    
+
     if (!request.file) {
       throw new ErrorHandler("Please upload a PDF file", 400);
     }
@@ -31,20 +21,24 @@ export const uploadSubjectNotes = async (request, reply) => {
 
     if (!subject) {
       // Delete uploaded file if subject verification fails
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
-      throw new ErrorHandler("You are not authorized to upload notes for this subject", 403);
+      await deleteFile(request.file.public_id);
+      throw new ErrorHandler(
+        "You are not authorized to upload notes for this subject",
+        403
+      );
     }
 
     const note = await Note.create({
       title,
       description,
-      filepath: request.file.id, // Store the GridFS file ID
+      filepath: request.file.path, // Cloudinary URL
+      publicId: request.file.public_id, // Store Cloudinary public_id
       uploadedBy: faculty._id,
       subject: subjectId,
       semester: subject.semester,
       year: subject.year,
       type,
-      filename: request.file.filename
+      filename: request.file.originalname,
     });
 
     // Update subject with new note reference
@@ -52,65 +46,60 @@ export const uploadSubjectNotes = async (request, reply) => {
       $push: { subjectNotes: note._id },
     });
 
+    // Create notification for all students in the subject's course
+    const students = await Student.find({
+      course: subject.course,
+      semester: subject.semester,
+    });
+
+    for (const student of students) {
+      await createNotification({
+        recipient: student._id,
+        recipientModel: "Student",
+        title: "New Notes Available",
+        message: `New ${type} notes uploaded for ${subject.subjectName}: ${title}`,
+        type: "NOTE",
+        relatedId: note._id,
+      });
+    }
+
     return reply.code(201).send({
       success: true,
       message: "Notes uploaded successfully",
-      note
+      note,
     });
   } catch (error) {
     // If there's an error and file was uploaded, delete it
-    if (request.file && request.file.id) {
-      await gfs.delete(new mongoose.Types.ObjectId(request.file.id));
+    if (request.file && request.file.public_id) {
+      await deleteFile(request.file.public_id);
     }
     throw new ErrorHandler(error.message, error.statusCode || 500);
   }
 };
 
-// Add a function to stream/download the PDF
-export const getNoteFile = async (request, reply) => {
+export const deleteNote = async (request, reply) => {
   try {
     const note = await Note.findById(request.params.id);
+
     if (!note) {
       throw new ErrorHandler("Note not found", 404);
     }
 
-    const file = await gfs.find({ _id: new mongoose.Types.ObjectId(note.filepath) }).toArray();
-    if (!file || file.length === 0) {
-      throw new ErrorHandler("File not found", 404);
+    // Check if faculty owns this note
+    if (note.uploadedBy.toString() !== request.user._id.toString()) {
+      throw new ErrorHandler("Not authorized to delete this note", 403);
     }
 
-    reply.header('Content-Type', 'application/pdf');
-    reply.header('Content-Disposition', `inline; filename="${note.filename}"`);
-    
-    const downloadStream = gfs.openDownloadStream(new mongoose.Types.ObjectId(note.filepath));
-    return reply.send(downloadStream);
+    // Delete file from Cloudinary
+    await deleteFile(note.publicId);
 
-  } catch (error) {
-    throw new ErrorHandler(error.message, error.statusCode || 500);
-  }
-};
-
-// function for remove a note upload by the faculty
-export const removeNote = async (request, reply) => {
-  try {
-    const faculty = request.user;
-    const noteId = request.params.id;
-
-    const note = await Note.findOne({ _id: noteId, uploadedBy: faculty._id });
-    if (!note) {
-      throw new ErrorHandler("Note not found or you are not authorized to delete this note", 404);
-    }
-
-    // Delete the note file from GridFS
-    await gfs.delete(new mongoose.Types.ObjectId(note.filepath));
-
-    // Remove the note reference from the subject
+    // Remove note reference from subject
     await Subject.findByIdAndUpdate(note.subject, {
       $pull: { subjectNotes: note._id },
     });
 
-    // Delete the note document from the database
-    await Note.findByIdAndDelete(noteId);
+    // Delete note from database
+    await note.remove();
 
     return reply.code(200).send({
       success: true,
